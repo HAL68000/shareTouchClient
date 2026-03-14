@@ -219,9 +219,7 @@ class _ViewerPageState extends State<ViewerPage> {
                 Positioned(
                   top: 8,
                   left: 8,
-                  right: 8,
                   child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       DecoratedBox(
                         decoration: BoxDecoration(
@@ -232,17 +230,6 @@ class _ViewerPageState extends State<ViewerPage> {
                           onPressed: () => Navigator.of(context).maybePop(),
                           tooltip: 'Chiudi viewer',
                           icon: const Icon(Icons.arrow_back),
-                        ),
-                      ),
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.55),
-                          shape: BoxShape.circle,
-                        ),
-                        child: IconButton(
-                          onPressed: _session.sendMeta,
-                          tooltip: 'Invia tasto Windows',
-                          icon: const Icon(Icons.window),
                         ),
                       ),
                     ],
