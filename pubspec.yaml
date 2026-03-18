@@ -13,6 +13,8 @@ dependencies:
   mobile_scanner: ^5.2.3
   socket_io_client: ^3.1.1
   flutter_webrtc: ^0.12.10
+  shared_preferences: ^2.3.3
+  wakelock_plus: ^1.2.8
 
 dev_dependencies:
   flutter_test:

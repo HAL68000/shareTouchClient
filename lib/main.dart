@@ -1,17 +1,173 @@
+// ignore_for_file: library_private_types_in_public_api
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+// ---------------------------------------------------------------------------
+// Data model: saved host entry
+// ---------------------------------------------------------------------------
+
+class HostEntry {
+  const HostEntry({required this.serverUrl, required this.label});
+
+  final String serverUrl;
+  final String label;
+
+  @override
+  bool operator ==(Object other) =>
+      other is HostEntry && other.serverUrl == serverUrl;
+
+  @override
+  int get hashCode => serverUrl.hashCode;
+
+  String toPrefsString() => '$serverUrl|$label';
+
+  static HostEntry? fromPrefsString(String s) {
+    final parts = s.split('|');
+    if (parts.length < 2 || parts[0].isEmpty) return null;
+    return HostEntry(serverUrl: parts[0], label: parts.sublist(1).join('|'));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Favorites store (singleton, persisted via shared_preferences)
+// ---------------------------------------------------------------------------
+
+class FavoritesStore extends ChangeNotifier {
+  FavoritesStore._();
+
+  static final FavoritesStore instance = FavoritesStore._();
+
+  static const _prefsKey = 'sharetouch_favorites';
+
+  List<HostEntry> _favorites = [];
+  List<HostEntry> get favorites => List.unmodifiable(_favorites);
+
+  Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_prefsKey) ?? [];
+    _favorites = raw
+        .map(HostEntry.fromPrefsString)
+        .whereType<HostEntry>()
+        .toList();
+    notifyListeners();
+  }
+
+  Future<void> add(HostEntry entry) async {
+    if (_favorites.contains(entry)) return;
+    _favorites = [..._favorites, entry];
+    await _persist();
+    notifyListeners();
+  }
+
+  Future<void> remove(HostEntry entry) async {
+    _favorites = _favorites.where((e) => e != entry).toList();
+    await _persist();
+    notifyListeners();
+  }
+
+  bool contains(HostEntry entry) => _favorites.contains(entry);
+
+  Future<void> _persist() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+        _prefsKey, _favorites.map((e) => e.toPrefsString()).toList());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Subnet scanner: discovers open TCP ports on the local /24 network
+// ---------------------------------------------------------------------------
+
+class _ScanProgress {
+  const _ScanProgress({
+    required this.scanned,
+    required this.total,
+    required this.found,
+  });
+
+  final int scanned;
+  final int total;
+  final List<String> found;
+}
+
+class SubnetScanner {
+  static Future<String?> getLocalIp() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLinkLocal: false,
+        type: InternetAddressType.IPv4,
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (!addr.isLoopback) return addr.address;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Stream<_ScanProgress> scan(String localIp, int port) async* {
+    final parts = localIp.split('.');
+    if (parts.length != 4) return;
+    final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+    const batchSize = 25;
+    const scanTimeout = Duration(milliseconds: 400);
+    final found = <String>[];
+    int scanned = 0;
+
+    for (int batchStart = 0; batchStart < 256; batchStart += batchSize) {
+      final end = math.min(batchStart + batchSize, 256);
+      final futures = List.generate(end - batchStart, (i) async {
+        final ip = '$prefix.${batchStart + i}';
+        try {
+          final socket = await Socket.connect(ip, port, timeout: scanTimeout);
+          socket.destroy();
+          return ip;
+        } catch (_) {
+          return null;
+        }
+      });
+      final results = await Future.wait(futures);
+      scanned += futures.length;
+      for (final r in results) {
+        if (r != null) found.add(r);
+      }
+      yield _ScanProgress(
+        scanned: scanned,
+        total: 256,
+        found: List.from(found),
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 void main() {
   runApp(const ShareTouchApp());
 }
 
-class ShareTouchApp extends StatelessWidget {
+class ShareTouchApp extends StatefulWidget {
   const ShareTouchApp({super.key});
+
+  @override
+  State<ShareTouchApp> createState() => _ShareTouchAppState();
+}
+
+class _ShareTouchAppState extends State<ShareTouchApp> {
+  @override
+  void initState() {
+    super.initState();
+    FavoritesStore.instance.load();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -92,6 +248,17 @@ class _ConnectPageState extends State<ConnectPage> {
     );
   }
 
+  Future<void> _openDiscovery() async {
+    final result = await Navigator.of(context).push<_DiscoveryResult>(
+      MaterialPageRoute(builder: (_) => const HostDiscoveryPage()),
+    );
+    if (result == null) return;
+    setState(() {
+      _serverController.text = result.serverUrl;
+      _sessionController.text = result.sessionId;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -134,6 +301,15 @@ class _ConnectPageState extends State<ConnectPage> {
                 ),
               ],
             ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _openDiscovery,
+                icon: const Icon(Icons.wifi_find),
+                label: const Text('Cerca host / Preferiti'),
+              ),
+            ),
             const SizedBox(height: 16),
             const Text(
               'Gesture supportate: tap click, drag mouse, pinch zoom (max 300%), 3 dita pan, doppio tap 2 dita = tasto Windows.',
@@ -172,6 +348,492 @@ class _QrScanPageState extends State<QrScanPage> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Host discovery result passed back to ConnectPage
+// ---------------------------------------------------------------------------
+
+class _DiscoveryResult {
+  const _DiscoveryResult({required this.serverUrl, required this.sessionId});
+
+  final String serverUrl;
+  final String sessionId;
+}
+
+// ---------------------------------------------------------------------------
+// Host Discovery Page
+// ---------------------------------------------------------------------------
+
+class HostDiscoveryPage extends StatefulWidget {
+  const HostDiscoveryPage({super.key});
+
+  @override
+  State<HostDiscoveryPage> createState() => _HostDiscoveryPageState();
+}
+
+class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
+  final _urlController = TextEditingController(text: 'http://');
+
+  // Manual Socket.IO search state
+  _DiscoverySession? _session;
+  List<_ActiveSession> _results = [];
+  bool _searching = false;
+  String? _error;
+
+  // Subnet scan state
+  bool _scanning = false;
+  _ScanProgress? _scanProgress;
+  List<String> _foundHosts = [];
+  StreamSubscription<_ScanProgress>? _scanSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    FavoritesStore.instance.addListener(_onFavoritesChanged);
+  }
+
+  void _onFavoritesChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    FavoritesStore.instance.removeListener(_onFavoritesChanged);
+    _scanSubscription?.cancel();
+    _session?.dispose();
+    _urlController.dispose();
+    super.dispose();
+  }
+
+  int _extractPort(String url) {
+    try {
+      final uri = Uri.parse(url.trim());
+      if (uri.hasPort) return uri.port;
+    } catch (_) {}
+    return 3000;
+  }
+
+  // ---- Manual Socket.IO search ----
+
+  Future<void> _search() async {
+    final url = _urlController.text.trim();
+    if (url.isEmpty || url == 'http://') {
+      setState(() => _error = 'Inserisci un URL server valido');
+      return;
+    }
+
+    _session?.dispose();
+    setState(() {
+      _searching = true;
+      _error = null;
+      _results = [];
+    });
+
+    final session = _DiscoverySession(serverUrl: url);
+    _session = session;
+
+    try {
+      final results = await session.fetchActiveSessions();
+      if (!mounted) return;
+      setState(() {
+        _results = results;
+        _searching = false;
+        if (results.isEmpty) _error = 'Nessuna sessione attiva trovata';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _searching = false;
+        _error = 'Errore connessione: $e';
+      });
+    }
+  }
+
+  // ---- Subnet scan ----
+
+  Future<void> _startScan() async {
+    _scanSubscription?.cancel();
+    setState(() {
+      _scanning = true;
+      _scanProgress = null;
+      _foundHosts = [];
+      _error = null;
+      _results = [];
+    });
+
+    final localIp = await SubnetScanner.getLocalIp();
+    if (!mounted) return;
+
+    if (localIp == null) {
+      setState(() {
+        _scanning = false;
+        _error = "Impossibile determinare l'indirizzo IP locale";
+      });
+      return;
+    }
+
+    final port = _extractPort(_urlController.text);
+
+    _scanSubscription = SubnetScanner().scan(localIp, port).listen(
+      (progress) {
+        if (!mounted) return;
+        setState(() {
+          _scanProgress = progress;
+          _foundHosts = progress.found;
+          if (progress.scanned >= progress.total) {
+            _scanning = false;
+            if (progress.found.isEmpty) {
+              _error = 'Nessun host trovato sulla porta $port';
+            }
+          }
+        });
+      },
+      onDone: () {
+        if (!mounted) return;
+        setState(() => _scanning = false);
+      },
+      onError: (Object e) {
+        if (!mounted) return;
+        setState(() {
+          _scanning = false;
+          _error = 'Errore scansione: $e';
+        });
+      },
+      cancelOnError: true,
+    );
+  }
+
+  void _cancelScan() {
+    _scanSubscription?.cancel();
+    setState(() => _scanning = false);
+  }
+
+  // When user taps a found host, auto-query its sessions
+  void _selectFoundHost(String ip) {
+    final port = _extractPort(_urlController.text);
+    setState(() {
+      _urlController.text = 'http://$ip:$port';
+      _results = [];
+      _error = null;
+    });
+    _search();
+  }
+
+  void _connectTo(_ActiveSession active) {
+    Navigator.of(context).pop(
+      _DiscoveryResult(
+        serverUrl: _urlController.text.trim(),
+        sessionId: active.sessionId,
+      ),
+    );
+  }
+
+  Future<void> _toggleFavorite(String serverUrl, String label) async {
+    final entry = HostEntry(serverUrl: serverUrl, label: label);
+    if (FavoritesStore.instance.contains(entry)) {
+      await FavoritesStore.instance.remove(entry);
+    } else {
+      await FavoritesStore.instance.add(entry);
+    }
+  }
+
+  void _loadFavorite(HostEntry entry) {
+    setState(() {
+      _urlController.text = entry.serverUrl;
+      _results = [];
+      _foundHosts = [];
+      _error = null;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final favorites = FavoritesStore.instance.favorites;
+    final currentUrl = _urlController.text.trim();
+    final isFavorite = favorites.any((e) => e.serverUrl == currentUrl);
+    final port = _extractPort(currentUrl);
+    final progress = _scanProgress;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Cerca host / Preferiti'),
+        actions: [
+          IconButton(
+            tooltip: isFavorite
+                ? 'Rimuovi dai preferiti'
+                : 'Aggiungi ai preferiti',
+            icon: Icon(
+              isFavorite ? Icons.star : Icons.star_border,
+              color: isFavorite ? Colors.amber : null,
+            ),
+            onPressed: () {
+              final url = _urlController.text.trim();
+              if (url.isEmpty || url == 'http://') return;
+              _toggleFavorite(url, url);
+            },
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.only(bottom: 32),
+        children: [
+          // ---- URL field + manual search ----
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _urlController,
+                    decoration: const InputDecoration(
+                      labelText: 'Server URL',
+                      hintText: 'http://192.168.1.10:3000',
+                    ),
+                    onSubmitted: (_) => _search(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: (_searching || _scanning) ? null : _search,
+                  icon: _searching
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.search),
+                  label: const Text('Cerca'),
+                ),
+              ],
+            ),
+          ),
+          // ---- Subnet scan button ----
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _scanning
+                    ? _cancelScan
+                    : (_searching ? null : _startScan),
+                icon: Icon(_scanning ? Icons.stop : Icons.wifi_find),
+                label: Text(
+                  _scanning
+                      ? 'Annulla scansione'
+                      : 'Scansiona rete locale (porta $port)',
+                ),
+              ),
+            ),
+          ),
+          // ---- Scan progress bar ----
+          if (_scanning || progress != null) ...[
+            const SizedBox(height: 10),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LinearProgressIndicator(
+                    value: progress == null
+                        ? null
+                        : progress.scanned / progress.total,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    progress == null
+                        ? 'Rilevamento IP locale...'
+                        : '${progress.scanned}/${progress.total} IP scansionati'
+                            '${progress.found.isEmpty ? "" : " \u00b7 ${progress.found.length} trovati"}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ],
+          // ---- Found hosts from TCP scan ----
+          if (_foundHosts.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: Text(
+                'Host trovati (porta $port)',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            ..._foundHosts.map(
+              (ip) => ListTile(
+                leading: const Icon(Icons.computer),
+                title: Text('http://$ip:$port'),
+                trailing: FilledButton.tonal(
+                  onPressed: () => _selectFoundHost(ip),
+                  child: const Text('Interroga'),
+                ),
+              ),
+            ),
+          ],
+          // ---- Error message ----
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          // ---- Sessions from Socket.IO query ----
+          if (_results.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: Text(
+                'Sessioni attive',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            ..._results.map(
+              (active) => ListTile(
+                leading: const Icon(Icons.desktop_windows),
+                title: Text(active.sessionId),
+                subtitle: active.hostName.isNotEmpty
+                    ? Text(
+                        active.hostName,
+                        style: const TextStyle(fontSize: 12),
+                      )
+                    : null,
+                trailing: FilledButton.tonal(
+                  onPressed: () => _connectTo(active),
+                  child: const Text('Connetti'),
+                ),
+              ),
+            ),
+          ],
+          // ---- Favorites ----
+          if (favorites.isNotEmpty) ...[
+            const Divider(height: 24),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: Text(
+                'Preferiti',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            ...favorites.map(
+              (fav) => ListTile(
+                leading: const Icon(Icons.star, color: Colors.amber),
+                title: Text(fav.label),
+                subtitle: Text(
+                  fav.serverUrl,
+                  style: const TextStyle(fontSize: 12),
+                ),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: 'Carica URL',
+                      icon: const Icon(Icons.open_in_new),
+                      onPressed: () => _loadFavorite(fav),
+                    ),
+                    IconButton(
+                      tooltip: 'Rimuovi preferito',
+                      icon: const Icon(Icons.delete_outline),
+                      onPressed: () =>
+                          FavoritesStore.instance.remove(fav),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Socket.IO session discovery (connects to a specific server URL)
+// ---------------------------------------------------------------------------
+
+class _ActiveSession {
+  const _ActiveSession({required this.sessionId, required this.hostName});
+
+  final String sessionId;
+  final String hostName;
+}
+
+class _DiscoverySession {
+  _DiscoverySession({required this.serverUrl});
+
+  final String serverUrl;
+  io.Socket? _socket;
+
+  Future<List<_ActiveSession>> fetchActiveSessions({
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final completer = Completer<List<_ActiveSession>>();
+
+    final socket = io.io(
+      serverUrl,
+      io.OptionBuilder()
+          .setTransports(['websocket'])
+          .disableAutoConnect()
+          .enableForceNew()
+          .build(),
+    );
+    _socket = socket;
+
+    void abort(String reason) {
+      if (!completer.isCompleted) completer.completeError(reason);
+    }
+
+    Timer? timer;
+
+    socket.onConnect((_) {
+      timer = Timer(timeout, () => abort('Timeout risposta server'));
+      socket.emit('mobile:list-sessions');
+    });
+
+    socket.on('mobile:sessions-list', (data) {
+      timer?.cancel();
+      final sessions = <_ActiveSession>[];
+      if (data is List) {
+        for (final item in data) {
+          if (item is Map) {
+            final id = item['sessionId']?.toString() ?? '';
+            final host = item['hostName']?.toString() ?? '';
+            if (id.isNotEmpty) {
+              sessions.add(_ActiveSession(sessionId: id, hostName: host));
+            }
+          }
+        }
+      }
+      if (!completer.isCompleted) completer.complete(sessions);
+    });
+
+    socket.onConnectError((e) => abort('Connessione rifiutata: $e'));
+    socket.onError((e) => abort('Errore socket: $e'));
+    socket.onDisconnect((_) {
+      if (!completer.isCompleted) completer.complete([]);
+    });
+
+    socket.connect();
+
+    try {
+      return await completer.future.timeout(timeout);
+    } finally {
+      timer?.cancel();
+      dispose();
+    }
+  }
+
+  void dispose() {
+    _socket?.disconnect();
+    _socket?.dispose();
+    _socket = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 class ViewerPage extends StatefulWidget {
   const ViewerPage({
     super.key,
@@ -192,6 +854,7 @@ class _ViewerPageState extends State<ViewerPage> {
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable();
     _session = ShareTouchSession(
       serverBaseUrl: widget.serverBaseUrl,
       sessionId: widget.sessionId,
@@ -200,6 +863,7 @@ class _ViewerPageState extends State<ViewerPage> {
 
   @override
   void dispose() {
+    WakelockPlus.disable();
     _session.dispose();
     super.dispose();
   }
@@ -474,8 +1138,8 @@ class _ControlSurfaceState extends State<ControlSurface> {
                   child: Transform(
                     alignment: Alignment.center,
                     transform: Matrix4.identity()
-                      ..translate(_pan.dx, _pan.dy)
-                      ..scale(_scale, _scale),
+                      ..translateByDouble(_pan.dx, _pan.dy, 0, 1)
+                      ..scaleByDouble(_scale, _scale, 1, 1),
                     child: RTCVideoView(
                       renderer,
                       objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
@@ -495,7 +1159,7 @@ class _ControlSurfaceState extends State<ControlSurface> {
                   child: Padding(
                     padding: const EdgeInsets.all(10),
                     child: Text(
-                      'Tap click · Drag move · Zoom ${(100 * _scale).round()}% · 3 dita pan · doppio tap 2 dita = Windows',
+                      'Tap click \u00b7 Drag move \u00b7 Zoom ${(100 * _scale).round()}% \u00b7 3 dita pan \u00b7 doppio tap 2 dita = Windows',
                       textAlign: TextAlign.center,
                       style: const TextStyle(fontSize: 12),
                     ),

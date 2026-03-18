@@ -1,0 +1,24 @@
+{
+  "java.import.exclusions": [
+    "**/build/**",
+    "**/.dart_tool/**",
+    "**/.gradle/**",
+    "**/android/.gradle/**"
+  ],
+  "files.exclude": {
+    "**/build": true,
+    "**/.dart_tool": true,
+    "**/.gradle": true
+  },
+  "search.exclude": {
+    "**/build": true,
+    "**/.dart_tool": true,
+    "**/.gradle": true
+  },
+  "files.watcherExclude": {
+    "**/build/**": true,
+    "**/.dart_tool/**": true,
+    "**/.gradle/**": true
+  },
+  "gradle.nestedProjects": false
+}
