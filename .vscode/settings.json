@@ -20,5 +20,15 @@
     "**/.dart_tool/**": true,
     "**/.gradle/**": true
   },
-  "gradle.nestedProjects": false
+  "gradle.nestedProjects": false,
+  "chat.tools.terminal.autoApprove": {
+    "/^node --check server\\.js$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^node --check server\\.js && node --check public/desktop\\.js$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
 }

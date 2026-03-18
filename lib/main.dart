@@ -693,12 +693,22 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
               (active) => ListTile(
                 leading: const Icon(Icons.desktop_windows),
                 title: Text(active.sessionId),
-                subtitle: active.hostName.isNotEmpty
-                    ? Text(
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (active.shareLabel.isNotEmpty)
+                      Text(
+                        active.shareLabel,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    if (active.hostName.isNotEmpty)
+                      Text(
                         active.hostName,
                         style: const TextStyle(fontSize: 12),
-                      )
-                    : null,
+                      ),
+                  ],
+                ),
                 trailing: FilledButton.tonal(
                   onPressed: () => _connectTo(active),
                   child: const Text('Connetti'),
@@ -754,9 +764,14 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
 // ---------------------------------------------------------------------------
 
 class _ActiveSession {
-  const _ActiveSession({required this.sessionId, required this.hostName});
+  const _ActiveSession({
+    required this.sessionId,
+    required this.shareLabel,
+    required this.hostName,
+  });
 
   final String sessionId;
+  final String shareLabel;
   final String hostName;
 }
 
@@ -799,9 +814,16 @@ class _DiscoverySession {
         for (final item in data) {
           if (item is Map) {
             final id = item['sessionId']?.toString() ?? '';
+            final shareLabel = item['shareLabel']?.toString() ?? '';
             final host = item['hostName']?.toString() ?? '';
             if (id.isNotEmpty) {
-              sessions.add(_ActiveSession(sessionId: id, hostName: host));
+              sessions.add(
+                _ActiveSession(
+                  sessionId: id,
+                  shareLabel: shareLabel,
+                  hostName: host,
+                ),
+              );
             }
           }
         }
