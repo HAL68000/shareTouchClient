@@ -1,9 +1,11 @@
 // ignore_for_file: library_private_types_in_public_api
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -79,6 +81,205 @@ class FavoritesStore extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
         _prefsKey, _favorites.map((e) => e.toPrefsString()).toList());
+  }
+}
+
+class PairingRequiredException implements Exception {
+  const PairingRequiredException({
+    required this.message,
+    this.requestId,
+    this.fingerprint,
+  });
+
+  final String message;
+  final String? requestId;
+  final String? fingerprint;
+
+  @override
+  String toString() => message;
+}
+
+class _ClientIdentity {
+  const _ClientIdentity({
+    required this.clientId,
+    required this.publicKeyBytes,
+    required this.privateKeyBytes,
+    required this.deviceLabel,
+  });
+
+  final String clientId;
+  final List<int> publicKeyBytes;
+  final List<int> privateKeyBytes;
+  final String deviceLabel;
+
+  SimpleKeyPairData toKeyPairData() {
+    return SimpleKeyPairData(
+      privateKeyBytes,
+      type: KeyPairType.ed25519,
+      publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.ed25519),
+    );
+  }
+}
+
+class ClientKeyStore {
+  ClientKeyStore._();
+
+  static final ClientKeyStore instance = ClientKeyStore._();
+
+  static const _prefsClientId = 'auth_client_id';
+  static const _prefsPub = 'auth_pub_ed25519';
+  static const _prefsPriv = 'auth_priv_ed25519';
+  static const _prefsLabel = 'auth_device_label';
+
+  final Ed25519 _algo = Ed25519();
+  _ClientIdentity? _cached;
+
+  Future<_ClientIdentity> loadOrCreate() async {
+    if (_cached != null) return _cached!;
+
+    final prefs = await SharedPreferences.getInstance();
+    final clientId = prefs.getString(_prefsClientId);
+    final pubB64 = prefs.getString(_prefsPub);
+    final privB64 = prefs.getString(_prefsPriv);
+    final deviceLabel = prefs.getString(_prefsLabel) ??
+        'Flutter ${Platform.operatingSystem}';
+
+    if (clientId != null && pubB64 != null && privB64 != null) {
+      _cached = _ClientIdentity(
+        clientId: clientId,
+        publicKeyBytes: base64Decode(pubB64),
+        privateKeyBytes: base64Decode(privB64),
+        deviceLabel: deviceLabel,
+      );
+      return _cached!;
+    }
+
+    final keyPair = await _algo.newKeyPair();
+    final pub = await keyPair.extractPublicKey();
+    final priv = await keyPair.extractPrivateKeyBytes();
+    final nextClientId = _generateClientId();
+
+    await prefs.setString(_prefsClientId, nextClientId);
+    await prefs.setString(_prefsPub, base64Encode(pub.bytes));
+    await prefs.setString(_prefsPriv, base64Encode(priv));
+    await prefs.setString(_prefsLabel, deviceLabel);
+
+    _cached = _ClientIdentity(
+      clientId: nextClientId,
+      publicKeyBytes: pub.bytes,
+      privateKeyBytes: priv,
+      deviceLabel: deviceLabel,
+    );
+    return _cached!;
+  }
+
+  String _generateClientId() {
+    final random = math.Random.secure();
+    final bytes = List<int>.generate(9, (_) => random.nextInt(256));
+    return 'mobile-${base64UrlEncode(bytes).replaceAll('=', '')}';
+  }
+}
+
+class SocketKeyAuth {
+  SocketKeyAuth._();
+
+  static Future<void> authenticate(
+    io.Socket socket, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final identity = await ClientKeyStore.instance.loadOrCreate();
+    final algo = Ed25519();
+    final completer = Completer<void>();
+
+    late void Function(dynamic) onChallenge;
+    late void Function(dynamic) onAuthOk;
+    late void Function(dynamic) onAuthFailed;
+    late void Function(dynamic) onPairingRequired;
+    late void Function(dynamic) onAuthRequired;
+
+    void cleanup() {
+      socket.off('mobile:auth-challenge', onChallenge);
+      socket.off('mobile:auth-ok', onAuthOk);
+      socket.off('mobile:auth-failed', onAuthFailed);
+      socket.off('mobile:pairing-required', onPairingRequired);
+      socket.off('mobile:auth-required', onAuthRequired);
+    }
+
+    onChallenge = (data) async {
+      if (completer.isCompleted) return;
+      final map = data is Map ? data : const <String, dynamic>{};
+      final nonceBase64 = map['nonceBase64']?.toString() ?? '';
+      if (nonceBase64.isEmpty) {
+        completer.completeError(Exception('Challenge non valida'));
+        return;
+      }
+
+      try {
+        final signature = await algo.sign(
+          base64Decode(nonceBase64),
+          keyPair: identity.toKeyPairData(),
+        );
+
+        socket.emit('mobile:auth-complete', {
+          'signatureBase64': base64Encode(signature.bytes),
+        });
+      } catch (e) {
+        completer.completeError(Exception('Errore firma challenge: $e'));
+      }
+    };
+
+    onAuthOk = (_) {
+      if (!completer.isCompleted) completer.complete();
+    };
+
+    onAuthFailed = (data) {
+      final map = data is Map ? data : const <String, dynamic>{};
+      final reason = map['reason']?.toString() ?? 'Autenticazione fallita';
+      if (!completer.isCompleted) {
+        completer.completeError(Exception(reason));
+      }
+    };
+
+    onPairingRequired = (data) {
+      final map = data is Map ? data : const <String, dynamic>{};
+      final message = map['message']?.toString() ??
+          'Dispositivo non autorizzato: pairing richiesto';
+      if (!completer.isCompleted) {
+        completer.completeError(
+          PairingRequiredException(
+            message: message,
+            requestId: map['requestId']?.toString(),
+            fingerprint: map['fingerprint']?.toString(),
+          ),
+        );
+      }
+    };
+
+    onAuthRequired = (data) {
+      final map = data is Map ? data : const <String, dynamic>{};
+      final reason = map['reason']?.toString() ?? 'Autenticazione richiesta';
+      if (!completer.isCompleted) {
+        completer.completeError(Exception(reason));
+      }
+    };
+
+    socket.on('mobile:auth-challenge', onChallenge);
+    socket.on('mobile:auth-ok', onAuthOk);
+    socket.on('mobile:auth-failed', onAuthFailed);
+    socket.on('mobile:pairing-required', onPairingRequired);
+    socket.on('mobile:auth-required', onAuthRequired);
+
+    socket.emit('mobile:auth-init', {
+      'clientId': identity.clientId,
+      'deviceLabel': identity.deviceLabel,
+      'publicKeyDerBase64': base64Encode(identity.publicKeyBytes),
+    });
+
+    try {
+      await completer.future.timeout(timeout);
+    } finally {
+      cleanup();
+    }
   }
 }
 
@@ -543,6 +744,7 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
       _foundHosts = [];
       _error = null;
     });
+    _search();
   }
 
   @override
@@ -576,39 +778,9 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
       body: ListView(
         padding: const EdgeInsets.only(bottom: 32),
         children: [
-          // ---- URL field + manual search ----
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _urlController,
-                    decoration: const InputDecoration(
-                      labelText: 'Server URL',
-                      hintText: 'http://192.168.1.10:3000',
-                    ),
-                    onSubmitted: (_) => _search(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton.icon(
-                  onPressed: (_searching || _scanning) ? null : _search,
-                  icon: _searching
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.search),
-                  label: const Text('Cerca'),
-                ),
-              ],
-            ),
-          ),
           // ---- Subnet scan button ----
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
             child: SizedBox(
               width: double.infinity,
               child: OutlinedButton.icon(
@@ -738,8 +910,8 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     IconButton(
-                      tooltip: 'Carica URL',
-                      icon: const Icon(Icons.open_in_new),
+                      tooltip: 'Interroga preferito',
+                      icon: const Icon(Icons.search),
                       onPressed: () => _loadFavorite(fav),
                     ),
                     IconButton(
@@ -802,8 +974,17 @@ class _DiscoverySession {
 
     Timer? timer;
 
-    socket.onConnect((_) {
+    socket.onConnect((_) async {
       timer = Timer(timeout, () => abort('Timeout risposta server'));
+      try {
+        await SocketKeyAuth.authenticate(socket, timeout: timeout);
+      } on PairingRequiredException catch (e) {
+        abort(e.message);
+        return;
+      } catch (e) {
+        abort('Autenticazione fallita: $e');
+        return;
+      }
       socket.emit('mobile:list-sessions');
     });
 
@@ -1231,7 +1412,18 @@ class ShareTouchSession extends ChangeNotifier {
 
     _socket = socket;
 
-    socket.onConnect((_) {
+    socket.onConnect((_) async {
+      setStatus('Socket connesso, autenticazione dispositivo...');
+      try {
+        await SocketKeyAuth.authenticate(socket);
+      } on PairingRequiredException catch (e) {
+        setStatus('${e.message}. Apri /admin/pairing sul server per approvare.');
+        return;
+      } catch (e) {
+        setStatus('Autenticazione fallita: $e');
+        return;
+      }
+
       setStatus('Socket connesso, join sessione...');
       socket.emit('mobile:join-session', {'sessionId': sessionId});
     });

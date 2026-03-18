@@ -29,6 +29,10 @@
     "/^node --check server\\.js && node --check public/desktop\\.js$/": {
       "approve": true,
       "matchCommandLine": true
+    },
+    "/^node --check public/desktop\\.js$/": {
+      "approve": true,
+      "matchCommandLine": true
     }
   }
 }
