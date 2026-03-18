@@ -584,22 +584,33 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
   bool _scanning = false;
   _ScanProgress? _scanProgress;
   List<String> _foundHosts = [];
+  final Map<String, bool> _hostOnline = {};
   StreamSubscription<_ScanProgress>? _scanSubscription;
+  Timer? _favoriteStatusTimer;
+  bool _refreshingFavoriteStatuses = false;
 
   @override
   void initState() {
     super.initState();
     FavoritesStore.instance.addListener(_onFavoritesChanged);
+    _refreshFavoriteStatuses();
+    _favoriteStatusTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+      if (!mounted) return;
+      _refreshFavoriteStatuses();
+    });
   }
 
   void _onFavoritesChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    _refreshFavoriteStatuses();
+    setState(() {});
   }
 
   @override
   void dispose() {
     FavoritesStore.instance.removeListener(_onFavoritesChanged);
     _scanSubscription?.cancel();
+    _favoriteStatusTimer?.cancel();
     _session?.dispose();
     _urlController.dispose();
     super.dispose();
@@ -728,6 +739,103 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
     );
   }
 
+  String _normalizeUrl(String serverUrl) {
+    final trimmed = serverUrl.trim();
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) return trimmed;
+    final port = uri.hasPort ? uri.port : 3000;
+    return '${uri.scheme}://${uri.host}:$port';
+  }
+
+  Future<bool> _isHostOnline(String serverUrl) async {
+    final uri = Uri.tryParse(serverUrl.trim());
+    if (uri == null || uri.host.isEmpty) return false;
+
+    final port = uri.hasPort ? uri.port : 3000;
+    try {
+      final socket = await Socket.connect(
+        uri.host,
+        port,
+        timeout: const Duration(milliseconds: 700),
+      );
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _refreshFavoriteStatuses() async {
+    if (_refreshingFavoriteStatuses) return;
+    _refreshingFavoriteStatuses = true;
+
+    final favorites = FavoritesStore.instance.favorites;
+    final nextStatuses = <String, bool>{};
+
+    for (final fav in favorites) {
+      final normalized = _normalizeUrl(fav.serverUrl);
+      final online = await _isHostOnline(fav.serverUrl);
+      if (!mounted) {
+        _refreshingFavoriteStatuses = false;
+        return;
+      }
+      nextStatuses[normalized] = online;
+    }
+
+    if (!mounted) {
+      _refreshingFavoriteStatuses = false;
+      return;
+    }
+
+    setState(() {
+      _hostOnline
+        ..clear()
+        ..addAll(nextStatuses);
+    });
+
+    _refreshingFavoriteStatuses = false;
+  }
+
+  Widget _statusDot(bool online) {
+    return Container(
+      width: 10,
+      height: 10,
+      decoration: BoxDecoration(
+        color: online ? Colors.green : Colors.red,
+        shape: BoxShape.circle,
+      ),
+    );
+  }
+
+  Widget _leadingFavoriteStatus({
+    required bool isFavorite,
+    required bool online,
+    required VoidCallback onToggleFavorite,
+  }) {
+    return SizedBox(
+      width: 56,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(20),
+            onTap: onToggleFavorite,
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(
+                isFavorite ? Icons.star : Icons.star_border,
+                color: isFavorite ? Colors.amber : null,
+                size: 20,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          _statusDot(online),
+        ],
+      ),
+    );
+  }
+
   Future<void> _toggleFavorite(String serverUrl, String label) async {
     final entry = HostEntry(serverUrl: serverUrl, label: label);
     if (FavoritesStore.instance.contains(entry)) {
@@ -750,30 +858,17 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
   @override
   Widget build(BuildContext context) {
     final favorites = FavoritesStore.instance.favorites;
+    final favoriteUrls = favorites
+        .map((e) => _normalizeUrl(e.serverUrl))
+        .toSet();
     final currentUrl = _urlController.text.trim();
-    final isFavorite = favorites.any((e) => e.serverUrl == currentUrl);
     final port = _extractPort(currentUrl);
     final progress = _scanProgress;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Cerca host / Preferiti'),
-        actions: [
-          IconButton(
-            tooltip: isFavorite
-                ? 'Rimuovi dai preferiti'
-                : 'Aggiungi ai preferiti',
-            icon: Icon(
-              isFavorite ? Icons.star : Icons.star_border,
-              color: isFavorite ? Colors.amber : null,
-            ),
-            onPressed: () {
-              final url = _urlController.text.trim();
-              if (url.isEmpty || url == 'http://') return;
-              _toggleFavorite(url, url);
-            },
-          ),
-        ],
+        actions: [],
       ),
       body: ListView(
         padding: const EdgeInsets.only(bottom: 32),
@@ -832,14 +927,26 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
               ),
             ),
             ..._foundHosts.map(
-              (ip) => ListTile(
-                leading: const Icon(Icons.computer),
-                title: Text('http://$ip:$port'),
-                trailing: FilledButton.tonal(
-                  onPressed: () => _selectFoundHost(ip),
-                  child: const Text('Interroga'),
-                ),
-              ),
+              (ip) {
+                final hostUrl = 'http://$ip:$port';
+                final normalized = _normalizeUrl(hostUrl);
+                final isFav = favoriteUrls.contains(normalized);
+
+                _hostOnline[normalized] = true;
+
+                return ListTile(
+                  leading: _leadingFavoriteStatus(
+                    isFavorite: isFav,
+                    online: true,
+                    onToggleFavorite: () => _toggleFavorite(hostUrl, hostUrl),
+                  ),
+                  title: Text(hostUrl),
+                  trailing: FilledButton.tonal(
+                    onPressed: () => _selectFoundHost(ip),
+                    child: const Text('Interroga'),
+                  ),
+                );
+              },
             ),
           ],
           // ---- Error message ----
@@ -894,35 +1001,32 @@ class _HostDiscoveryPageState extends State<HostDiscoveryPage> {
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               child: Text(
-                'Preferiti',
+                'Host preferiti',
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
             ),
             ...favorites.map(
-              (fav) => ListTile(
-                leading: const Icon(Icons.star, color: Colors.amber),
-                title: Text(fav.label),
-                subtitle: Text(
-                  fav.serverUrl,
-                  style: const TextStyle(fontSize: 12),
-                ),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      tooltip: 'Interroga preferito',
-                      icon: const Icon(Icons.search),
-                      onPressed: () => _loadFavorite(fav),
-                    ),
-                    IconButton(
-                      tooltip: 'Rimuovi preferito',
-                      icon: const Icon(Icons.delete_outline),
-                      onPressed: () =>
-                          FavoritesStore.instance.remove(fav),
-                    ),
-                  ],
-                ),
-              ),
+              (fav) {
+                final normalized = _normalizeUrl(fav.serverUrl);
+                final online = _hostOnline[normalized] ?? false;
+
+                return ListTile(
+                  leading: _leadingFavoriteStatus(
+                    isFavorite: true,
+                    online: online,
+                    onToggleFavorite: () => FavoritesStore.instance.remove(fav),
+                  ),
+                  title: Text(fav.label),
+                  subtitle: Text(
+                    fav.serverUrl,
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  trailing: FilledButton.tonal(
+                    onPressed: () => _loadFavorite(fav),
+                    child: const Text('Interroga'),
+                  ),
+                );
+              },
             ),
           ],
         ],
